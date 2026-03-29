@@ -1,9 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import Anthropic from '@anthropic-ai/sdk'
 
-// Increase body size limit to 30MB and timeout to 60s for audio uploads
+// Increase timeout to 60s for audio uploads
 export const maxDuration = 60
-export const dynamic = 'force-dynamic'
 
 const anthropic = new Anthropic({
   apiKey: process.env.ANTHROPIC_API_KEY,

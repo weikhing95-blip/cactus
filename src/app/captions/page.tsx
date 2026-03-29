@@ -52,71 +52,75 @@ function isVideoFile(file: File): boolean {
   )
 }
 
-/** Convert AudioBuffer to WAV blob (client-side, no ffmpeg needed) */
-function audioBufferToWav(audioBuffer: AudioBuffer): Blob {
-  const numChannels = Math.min(audioBuffer.numberOfChannels, 2)
-  const sampleRate = audioBuffer.sampleRate
-  const format = 1 // PCM
-  const bitDepth = 16
+/** Extract audio from a video file using AudioContext + MediaRecorder at 4x speed. */
+async function extractAudioFromVideo(
+  file: File,
+  onProgress: (status: string) => void
+): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const videoEl = document.createElement('video')
+    videoEl.src = URL.createObjectURL(file)
+    videoEl.muted = false
+    videoEl.style.display = 'none'
+    document.body.appendChild(videoEl)
 
-  const channelData: Float32Array[] = []
-  for (let c = 0; c < numChannels; c++) {
-    channelData.push(audioBuffer.getChannelData(c))
-  }
+    videoEl.onloadedmetadata = async () => {
+      try {
+        const AudioCtxClass =
+          window.AudioContext ||
+          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
+        const audioCtx = new AudioCtxClass()
+        const source = audioCtx.createMediaElementSource(videoEl)
+        const dest = audioCtx.createMediaStreamDestination()
+        source.connect(dest)
 
-  const numSamples = channelData[0].length
-  const dataSize = numSamples * numChannels * (bitDepth / 8)
-  const buffer = new ArrayBuffer(44 + dataSize)
-  const view = new DataView(buffer)
+        const chunks: BlobPart[] = []
+        const recorder = new MediaRecorder(dest.stream, {
+          mimeType: 'audio/webm;codecs=opus',
+          audioBitsPerSecond: 32000,
+        })
 
-  // WAV header
-  const writeString = (offset: number, str: string) => {
-    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i))
-  }
-  writeString(0, 'RIFF')
-  view.setUint32(4, 36 + dataSize, true)
-  writeString(8, 'WAVE')
-  writeString(12, 'fmt ')
-  view.setUint32(16, 16, true)
-  view.setUint16(20, format, true)
-  view.setUint16(22, numChannels, true)
-  view.setUint32(24, sampleRate, true)
-  view.setUint32(28, sampleRate * numChannels * (bitDepth / 8), true)
-  view.setUint16(32, numChannels * (bitDepth / 8), true)
-  view.setUint16(34, bitDepth, true)
-  writeString(36, 'data')
-  view.setUint32(40, dataSize, true)
+        recorder.ondataavailable = (e) => {
+          if (e.data.size > 0) chunks.push(e.data)
+        }
 
-  // Interleave channels
-  let offset = 44
-  for (let i = 0; i < numSamples; i++) {
-    for (let c = 0; c < numChannels; c++) {
-      const sample = Math.max(-1, Math.min(1, channelData[c][i]))
-      view.setInt16(offset, sample < 0 ? sample * 0x8000 : sample * 0x7fff, true)
-      offset += 2
+        recorder.onstop = () => {
+          document.body.removeChild(videoEl)
+          URL.revokeObjectURL(videoEl.src)
+          audioCtx.close()
+          const blob = new Blob(chunks, { type: 'audio/webm' })
+          resolve(blob)
+        }
+
+        recorder.onerror = () => {
+          reject(new Error('Audio recording failed'))
+        }
+
+        // Play at 4x speed to reduce wait time
+        videoEl.playbackRate = 4.0
+        recorder.start(1000)
+        videoEl.play()
+
+        const duration = videoEl.duration
+        videoEl.ontimeupdate = () => {
+          const pct = Math.round((videoEl.currentTime / duration) * 100)
+          onProgress(`Extracting audio... ${pct}%`)
+        }
+
+        videoEl.onended = () => {
+          recorder.stop()
+        }
+      } catch (err) {
+        document.body.removeChild(videoEl)
+        reject(err)
+      }
     }
-  }
 
-  return new Blob([buffer], { type: 'audio/wav' })
-}
-
-/** Extract audio from a video file using the Web Audio API. Falls back to original file on failure. */
-async function extractAudioFromVideo(file: File): Promise<{ blob: Blob; name: string }> {
-  try {
-    const arrayBuffer = await file.arrayBuffer()
-    // Use OfflineAudioContext for decoding without playback
-    const AudioContextClass =
-      window.AudioContext || (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-    const tempCtx = new AudioContextClass()
-    const audioBuffer = await tempCtx.decodeAudioData(arrayBuffer)
-    await tempCtx.close()
-    const wavBlob = audioBufferToWav(audioBuffer)
-    return { blob: wavBlob, name: 'audio.wav' }
-  } catch (err) {
-    console.warn('Audio extraction failed, sending original file:', err)
-    // Groq Whisper accepts video files too — fall back gracefully
-    return { blob: file, name: file.name }
-  }
+    videoEl.onerror = () => {
+      document.body.removeChild(videoEl)
+      reject(new Error('Could not load video file'))
+    }
+  })
 }
 
 export default function CaptionsPage() {
@@ -125,7 +129,7 @@ export default function CaptionsPage() {
   const [language, setLanguage] = useState('en')
   const [isDragging, setIsDragging] = useState(false)
   const [loading, setLoading] = useState(false)
-  const [loadingStep, setLoadingStep] = useState<'transcribing' | 'correcting' | null>(null)
+  const [loadingMessage, setLoadingMessage] = useState<string>('Processing...')
   const [result, setResult] = useState<CaptionResult | null>(null)
   const [error, setError] = useState<string | null>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
@@ -184,29 +188,29 @@ export default function CaptionsPage() {
     if (!mediaFile) return
 
     setLoading(true)
+    setLoadingMessage('Processing...')
     setError(null)
     setResult(null)
-    setLoadingStep('transcribing')
 
     try {
       let audioBlob: Blob
       let audioName: string
 
       if (isVideoFile(mediaFile)) {
-        const extracted = await extractAudioFromVideo(mediaFile)
-        audioBlob = extracted.blob
-        audioName = extracted.name
+        setLoadingMessage('Extracting audio... 0%')
+        audioBlob = await extractAudioFromVideo(mediaFile, setLoadingMessage)
+        audioName = 'audio.webm'
       } else {
         audioBlob = mediaFile
         audioName = mediaFile.name
       }
 
+      setLoadingMessage('Transcribing & correcting...')
+
       const formData = new FormData()
       formData.append('audio', audioBlob, audioName)
       formData.append('businessContext', businessContext)
       formData.append('language', language)
-
-      setLoadingStep('correcting')
 
       const response = await fetch('/api/captions', {
         method: 'POST',
@@ -226,7 +230,7 @@ export default function CaptionsPage() {
       setError('Something went wrong. Please check your connection and try again.')
     } finally {
       setLoading(false)
-      setLoadingStep(null)
+      setLoadingMessage('Processing...')
     }
   }
 
@@ -380,7 +384,7 @@ export default function CaptionsPage() {
                     d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
                   />
                 </svg>
-                {loadingStep === 'transcribing' ? 'Transcribing...' : 'Correcting with AI...'}
+                {loadingMessage}
               </span>
             ) : (
               'Generate Captions'
