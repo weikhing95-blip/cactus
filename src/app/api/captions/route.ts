@@ -1,205 +1,117 @@
-import { NextRequest, NextResponse } from 'next/server'
-import Anthropic from '@anthropic-ai/sdk'
-import { del } from '@vercel/blob'
+import { NextRequest, NextResponse } from 'next/server';
+import Anthropic from '@anthropic-ai/sdk';
+import { put, del } from '@vercel/blob';
 
-// Increase timeout to 60s for audio processing
-export const maxDuration = 60
+export const maxDuration = 120;
 
-const anthropic = new Anthropic({
-  apiKey: process.env.ANTHROPIC_API_KEY,
-})
+const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-interface WhisperSegment {
-  id: number
-  start: number
-  end: number
-  text: string
-}
+const LANG_LABELS: Record<string, string> = {
+  en: 'English',
+  ms: 'Bahasa Malaysia',
+  id: 'Bahasa Indonesia',
+  zh: 'Mandarin Chinese (SEA context)',
+};
 
-interface WhisperResponse {
-  text: string
-  segments?: WhisperSegment[]
-  error?: { message: string }
-}
-
-interface CorrectionItem {
-  original: string
-  corrected: string
-  reason: string
-}
-
-interface ClaudeResponse {
-  corrected_transcript: string
-  segments: { start: number; end: number; text: string }[]
-  corrections: CorrectionItem[]
-}
-
-function formatSrtTime(seconds: number): string {
-  const hours = Math.floor(seconds / 3600)
-  const minutes = Math.floor((seconds % 3600) / 60)
-  const secs = Math.floor(seconds % 60)
-  const ms = Math.round((seconds % 1) * 1000)
-  return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}:${String(secs).padStart(2, '0')},${String(ms).padStart(3, '0')}`
-}
-
-function generateSrt(segments: { start: number; end: number; text: string }[]): string {
-  return segments
-    .map((seg, idx) => {
-      return `${idx + 1}\n${formatSrtTime(seg.start)} --> ${formatSrtTime(seg.end)}\n${seg.text.trim()}\n`
-    })
-    .join('\n')
-}
-
-export async function POST(req: NextRequest) {
-  // Check GROQ API key
-  const groqKey = process.env.GROQ_API_KEY
-  if (!groqKey || groqKey === 'your_groq_api_key_here' || groqKey.trim() === '') {
-    return NextResponse.json(
-      {
-        error:
-          'Please add your free Groq API key to enable transcription. Get one free at console.groq.com, then add GROQ_API_KEY to your .env.local file.',
-      },
-      { status: 400 }
-    )
-  }
-
-  let blobUrl: string
-  let businessContext: string
-  let language: string
-  let fileName: string
-
+export async function POST(request: NextRequest) {
   try {
-    const body = await req.json()
-    blobUrl = body.blobUrl
-    businessContext = body.businessContext || ''
-    language = body.language || 'en'
-    fileName = body.fileName || 'audio.mp4'
-  } catch {
-    return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 })
-  }
+    const formData = await request.formData();
+    const file = formData.get('file') as File | null;
+    const businessContext = formData.get('businessContext') as string || '';
+    const language = formData.get('language') as string || 'en';
 
-  if (!blobUrl) {
-    return NextResponse.json({ error: 'No file URL provided.' }, { status: 400 })
-  }
-
-  // Step 1: Download audio from blob URL server-side
-  let audioBlob: Blob
-  try {
-    const audioResponse = await fetch(blobUrl)
-    if (!audioResponse.ok) {
-      return NextResponse.json(
-        { error: 'Failed to download uploaded file. Please try again.' },
-        { status: 502 }
-      )
+    if (!file) {
+      return NextResponse.json({ error: 'No file provided' }, { status: 400 });
     }
-    const audioBuffer = await audioResponse.arrayBuffer()
-    const contentType = audioResponse.headers.get('content-type') || 'audio/mp4'
-    audioBlob = new Blob([audioBuffer], { type: contentType })
-  } catch (err) {
-    console.error('Blob download error:', err)
-    return NextResponse.json(
-      { error: 'Failed to retrieve uploaded file. Please try again.' },
-      { status: 502 }
-    )
-  }
 
-  // Step 2: Groq Whisper transcription
-  let transcription: WhisperResponse
-  try {
-    const groqForm = new FormData()
-    groqForm.append('file', audioBlob, fileName)
-    groqForm.append('model', 'whisper-large-v3')
-    groqForm.append('language', language)
-    groqForm.append('response_format', 'verbose_json')
+    // Upload to Vercel Blob
+    const blob = await put(file.name, file, { access: 'public' });
 
-    const groqResponse = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${groqKey}`,
-      },
-      body: groqForm,
-    })
+    let rawTranscript = '';
+    try {
+      const blobResponse = await fetch(blob.url);
+      const audioBuffer = await blobResponse.arrayBuffer();
+      const audioFile = new File([audioBuffer], file.name, { type: file.type || 'audio/mpeg' });
 
-    transcription = await groqResponse.json()
+      const groqForm = new FormData();
+      groqForm.append('file', audioFile);
+      groqForm.append('model', 'whisper-large-v3');
+      groqForm.append('response_format', 'json');
 
-    if (!groqResponse.ok) {
-      const errMsg = transcription?.error?.message || 'Groq transcription failed.'
-      return NextResponse.json({ error: `Transcription error: ${errMsg}` }, { status: 502 })
+      const groqResponse = await fetch('https://api.groq.com/openai/v1/audio/transcriptions', {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${process.env.GROQ_API_KEY}` },
+        body: groqForm,
+      });
+
+      if (!groqResponse.ok) {
+        const err = await groqResponse.text();
+        throw new Error(`Groq error: ${err}`);
+      }
+
+      const groqData = await groqResponse.json();
+      rawTranscript = groqData.text || '';
+    } finally {
+      await del(blob.url);
     }
-  } catch (err) {
-    console.error('Groq transcription error:', err)
-    return NextResponse.json(
-      { error: 'Failed to connect to Groq transcription service. Please try again.' },
-      { status: 502 }
-    )
-  } finally {
-    // Delete blob after downloading (cleanup) — fire and forget
-    del(blobUrl).catch((err) => console.error('Blob cleanup error:', err))
+
+    if (!rawTranscript) {
+      return NextResponse.json({ error: 'Could not extract speech from file.' }, { status: 422 });
+    }
+
+    const langLabel = LANG_LABELS[language] || 'English';
+    let correctedTranscript = rawTranscript;
+    let corrections: Array<{ original: string; corrected: string; reason: string }> = [];
+
+    try {
+      const claudeResponse = await client.messages.create({
+        model: 'claude-3-haiku-20240307',
+        max_tokens: 4096,
+        system: `You are an expert transcription editor for ${langLabel} content.
+Business context: ${businessContext || 'None provided.'}
+Correct the transcript using business context (prices, brand names, technical terms).
+Return ONLY valid JSON: { "corrected_transcript": string, "corrections": [{ "original": string, "corrected": string, "reason": string }] }`,
+        messages: [{ role: 'user', content: `Correct this transcript:\n\n${rawTranscript}` }],
+      });
+
+      const text = claudeResponse.content[0].type === 'text' ? claudeResponse.content[0].text : '';
+      const parsed = JSON.parse(text);
+      correctedTranscript = parsed.corrected_transcript || rawTranscript;
+      corrections = parsed.corrections || [];
+    } catch {
+      correctedTranscript = rawTranscript;
+    }
+
+    const srt = generateSRT(correctedTranscript);
+
+    // Return corrected_transcript mapped to transcript for frontend compatibility
+    return NextResponse.json({
+      transcript: correctedTranscript,
+      raw_transcript: rawTranscript,
+      corrections,
+      srt,
+    });
+  } catch (error) {
+    console.error('Captions error:', error);
+    return NextResponse.json({ error: 'Something went wrong. Please try again.' }, { status: 500 });
   }
-
-  const rawTranscript = transcription.text || ''
-  const rawSegments: WhisperSegment[] = transcription.segments || []
-
-  // Step 3: Claude correction
-  let correctedTranscript = rawTranscript
-  let correctedSegments = rawSegments.map((s) => ({ start: s.start, end: s.end, text: s.text }))
-  let corrections: CorrectionItem[] = []
-
-  const contextNote = businessContext
-    ? `Business context: ${businessContext}`
-    : 'No specific business context provided.'
-
-  const segmentsJson = JSON.stringify(
-    rawSegments.map((s) => ({ start: s.start, end: s.end, text: s.text }))
-  )
-
-  try {
-    const claudeResponse = await anthropic.messages.create({
-      model: 'claude-3-haiku-20240307',
-      max_tokens: 4096,
-      system: `You are an expert transcript editor. You will receive a raw transcript (with timestamps) and business context. 
-Identify and correct errors caused by the transcription model misinterpreting domain-specific terms, prices, brand names, product names, or technical vocabulary.
-Common errors: prices like "$32.99" that should be "$3,299", brand names spelled wrong, industry jargon misheard.
-Return ONLY valid JSON with no markdown fences, no explanation outside the JSON:
-{
-  "corrected_transcript": "full corrected text as a single string",
-  "segments": [{"start": 0.0, "end": 4.5, "text": "corrected segment text"}],
-  "corrections": [{"original": "what whisper said", "corrected": "what it should be", "reason": "why this was wrong"}]
 }
-If no corrections are needed, return the original text unchanged and an empty corrections array.`,
-      messages: [
-        {
-          role: 'user',
-          content: `${contextNote}\n\nRaw transcript:\n${rawTranscript}\n\nTimestamped segments:\n${segmentsJson}`,
-        },
-      ],
-    })
 
-    const rawContent = claudeResponse.content[0]
-    if (rawContent.type === 'text') {
-      let jsonText = rawContent.text.trim()
-      // Strip markdown fences if present
-      jsonText = jsonText.replace(/^```json\s*/i, '').replace(/```\s*$/i, '').trim()
-      const parsed: ClaudeResponse = JSON.parse(jsonText)
-      correctedTranscript = parsed.corrected_transcript || rawTranscript
-      correctedSegments =
-        parsed.segments?.length > 0
-          ? parsed.segments
-          : rawSegments.map((s) => ({ start: s.start, end: s.end, text: s.text }))
-      corrections = parsed.corrections || []
-    }
-  } catch (err) {
-    console.error('Claude correction error:', err)
-    // Fall back to raw transcript — don't fail the whole request
-    corrections = []
+function generateSRT(transcript: string): string {
+  const words = transcript.split(' ');
+  const chunkSize = 10;
+  const chunks: string[] = [];
+  for (let i = 0; i < words.length; i += chunkSize) {
+    chunks.push(words.slice(i, i + chunkSize).join(' '));
   }
+  return chunks.map((chunk, i) => {
+    const start = i * 3;
+    const end = start + 3;
+    return `${i + 1}\n${fmt(start)} --> ${fmt(end)}\n${chunk}\n`;
+  }).join('\n');
+}
 
-  // Step 4: Generate SRT
-  const srt = generateSrt(correctedSegments)
-
-  return NextResponse.json({
-    transcript: correctedTranscript,
-    corrections,
-    srt,
-  })
+function fmt(s: number): string {
+  const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+  return `${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(sec).padStart(2,'0')},000`;
 }

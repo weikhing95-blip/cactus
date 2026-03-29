@@ -125,41 +125,18 @@ export default function CaptionsPage() {
     setResult(null)
 
     try {
-      // Step 1: Upload file directly to Vercel Blob
-      setLoadingMessage('Uploading video...')
-      const { upload } = await import('@vercel/blob/client')
-      const blob = await upload(mediaFile.name, mediaFile, {
-        access: 'public',
-        handleUploadUrl: '/api/captions/upload-token',
-      })
-
-      // Step 2: Send blob URL to captions API
-      setLoadingMessage('Transcribing & correcting with AI...')
-      const response = await fetch('/api/captions', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          blobUrl: blob.url,
-          businessContext,
-          language,
-          fileName: mediaFile.name,
-        }),
-      })
-
+      const formData = new FormData()
+      formData.append('file', mediaFile)
+      formData.append('businessContext', businessContext)
+      formData.append('language', language)
+      const response = await fetch('/api/captions', { method: 'POST', body: formData })
       const data = await response.json()
-
-      if (!response.ok) {
-        setError(data.error || 'Something went wrong. Please try again.')
-        return
-      }
-
-      setResult(data as CaptionResult)
+      if (!response.ok) throw new Error(data.error || 'Something went wrong')
+      setResult(data)
     } catch (err) {
-      console.error('Caption generation error:', err)
-      setError('Something went wrong. Please check your connection and try again.')
+      setError(err instanceof Error ? err.message : 'Something went wrong')
     } finally {
       setLoading(false)
-      setLoadingMessage('Processing...')
     }
   }
 
