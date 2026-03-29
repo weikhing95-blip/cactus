@@ -10,13 +10,15 @@ const ACCEPTED_AUDIO_TYPES = [
   'audio/x-m4a',
   'audio/webm',       // .webm audio
   'audio/ogg',        // .ogg
+  'audio/aac',        // .aac
   'video/mp4',        // .mp4
   'video/webm',       // .webm video
   'video/quicktime',  // .mov
+  'video/x-msvideo',  // .avi
 ]
 
-const ACCEPTED_EXTENSIONS = ['.mp3', '.mp4', '.wav', '.m4a', '.webm', '.ogg', '.mov']
-const MAX_FILE_SIZE = 25 * 1024 * 1024 // 25MB
+const ACCEPTED_EXTENSIONS = ['.mp3', '.mp4', '.wav', '.m4a', '.webm', '.ogg', '.mov', '.aac', '.avi']
+const MAX_FILE_SIZE = 500 * 1024 * 1024 // 500MB
 
 const LANGUAGE_OPTIONS = [
   { value: 'en', label: '🇬🇧 English' },
@@ -48,79 +50,9 @@ function isVideoFile(file: File): boolean {
     file.type.startsWith('video/') ||
     file.name.toLowerCase().endsWith('.mp4') ||
     file.name.toLowerCase().endsWith('.mov') ||
-    file.name.toLowerCase().endsWith('.webm')
+    file.name.toLowerCase().endsWith('.webm') ||
+    file.name.toLowerCase().endsWith('.avi')
   )
-}
-
-/** Extract audio from a video file using AudioContext + MediaRecorder at 4x speed. */
-async function extractAudioFromVideo(
-  file: File,
-  onProgress: (status: string) => void
-): Promise<Blob> {
-  return new Promise((resolve, reject) => {
-    const videoEl = document.createElement('video')
-    videoEl.src = URL.createObjectURL(file)
-    videoEl.muted = false
-    videoEl.style.display = 'none'
-    document.body.appendChild(videoEl)
-
-    videoEl.onloadedmetadata = async () => {
-      try {
-        const AudioCtxClass =
-          window.AudioContext ||
-          (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext
-        const audioCtx = new AudioCtxClass()
-        const source = audioCtx.createMediaElementSource(videoEl)
-        const dest = audioCtx.createMediaStreamDestination()
-        source.connect(dest)
-
-        const chunks: BlobPart[] = []
-        const recorder = new MediaRecorder(dest.stream, {
-          mimeType: 'audio/webm;codecs=opus',
-          audioBitsPerSecond: 32000,
-        })
-
-        recorder.ondataavailable = (e) => {
-          if (e.data.size > 0) chunks.push(e.data)
-        }
-
-        recorder.onstop = () => {
-          document.body.removeChild(videoEl)
-          URL.revokeObjectURL(videoEl.src)
-          audioCtx.close()
-          const blob = new Blob(chunks, { type: 'audio/webm' })
-          resolve(blob)
-        }
-
-        recorder.onerror = () => {
-          reject(new Error('Audio recording failed'))
-        }
-
-        // Play at 4x speed to reduce wait time
-        videoEl.playbackRate = 4.0
-        recorder.start(1000)
-        videoEl.play()
-
-        const duration = videoEl.duration
-        videoEl.ontimeupdate = () => {
-          const pct = Math.round((videoEl.currentTime / duration) * 100)
-          onProgress(`Extracting audio... ${pct}%`)
-        }
-
-        videoEl.onended = () => {
-          recorder.stop()
-        }
-      } catch (err) {
-        document.body.removeChild(videoEl)
-        reject(err)
-      }
-    }
-
-    videoEl.onerror = () => {
-      document.body.removeChild(videoEl)
-      reject(new Error('Could not load video file'))
-    }
-  })
 }
 
 export default function CaptionsPage() {
@@ -148,7 +80,7 @@ export default function CaptionsPage() {
       return
     }
     if (file.size > MAX_FILE_SIZE) {
-      setError(`File too large (${formatFileSize(file.size)}). Maximum size is 25 MB.`)
+      setError(`File too large (${formatFileSize(file.size)}). Maximum size is 500 MB.`)
       return
     }
     setMediaFile(file)
@@ -193,28 +125,25 @@ export default function CaptionsPage() {
     setResult(null)
 
     try {
-      let audioBlob: Blob
-      let audioName: string
+      // Step 1: Upload file directly to Vercel Blob
+      setLoadingMessage('Uploading video...')
+      const { upload } = await import('@vercel/blob/client')
+      const blob = await upload(mediaFile.name, mediaFile, {
+        access: 'public',
+        handleUploadUrl: '/api/captions/upload-token',
+      })
 
-      if (isVideoFile(mediaFile)) {
-        setLoadingMessage('Extracting audio... 0%')
-        audioBlob = await extractAudioFromVideo(mediaFile, setLoadingMessage)
-        audioName = 'audio.webm'
-      } else {
-        audioBlob = mediaFile
-        audioName = mediaFile.name
-      }
-
-      setLoadingMessage('Transcribing & correcting...')
-
-      const formData = new FormData()
-      formData.append('audio', audioBlob, audioName)
-      formData.append('businessContext', businessContext)
-      formData.append('language', language)
-
+      // Step 2: Send blob URL to captions API
+      setLoadingMessage('Transcribing & correcting with AI...')
       const response = await fetch('/api/captions', {
         method: 'POST',
-        body: formData,
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          blobUrl: blob.url,
+          businessContext,
+          language,
+          fileName: mediaFile.name,
+        }),
       })
 
       const data = await response.json()
@@ -277,7 +206,7 @@ export default function CaptionsPage() {
             <label className="mb-2 block text-sm font-medium text-gray-300">
               Upload File{' '}
               <span className="text-gray-500">
-                (.mp3, .mp4, .wav, .m4a, .webm, .ogg, .mov — max 25 MB)
+                (.mp3, .mp4, .wav, .m4a, .webm, .ogg, .mov — up to 500 MB supported)
               </span>
             </label>
             {!mediaFile ? (
@@ -297,11 +226,11 @@ export default function CaptionsPage() {
               >
                 <div className="mb-3 text-4xl">🎙️</div>
                 <p className="font-medium text-gray-300">Drag & drop or click to upload</p>
-                <p className="mt-1 text-sm text-gray-500">Video or audio file</p>
+                <p className="mt-1 text-sm text-gray-500">Video or audio file — up to 500 MB</p>
                 <input
                   ref={fileInputRef}
                   type="file"
-                  accept=".mp3,.mp4,.wav,.m4a,.webm,.ogg,.mov,audio/*,video/*"
+                  accept=".mp3,.mp4,.wav,.m4a,.webm,.ogg,.mov,.aac,.avi,audio/*,video/*"
                   className="hidden"
                   onChange={handleFileInputChange}
                 />

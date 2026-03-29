@@ -1,7 +1,8 @@
 import { NextRequest, NextResponse } from 'next/server'
 import Anthropic from '@anthropic-ai/sdk'
+import { del } from '@vercel/blob'
 
-// Increase timeout to 60s for audio uploads
+// Increase timeout to 60s for audio processing
 export const maxDuration = 60
 
 const anthropic = new Anthropic({
@@ -62,26 +63,51 @@ export async function POST(req: NextRequest) {
     )
   }
 
-  let formData: FormData
+  let blobUrl: string
+  let businessContext: string
+  let language: string
+  let fileName: string
+
   try {
-    formData = await req.formData()
+    const body = await req.json()
+    blobUrl = body.blobUrl
+    businessContext = body.businessContext || ''
+    language = body.language || 'en'
+    fileName = body.fileName || 'audio.mp4'
   } catch {
-    return NextResponse.json({ error: 'Invalid form data.' }, { status: 400 })
+    return NextResponse.json({ error: 'Invalid JSON body.' }, { status: 400 })
   }
 
-  const audioFile = formData.get('audio') as File | null
-  const businessContext = (formData.get('businessContext') as string) || ''
-  const language = (formData.get('language') as string) || 'en'
-
-  if (!audioFile) {
-    return NextResponse.json({ error: 'No audio file provided.' }, { status: 400 })
+  if (!blobUrl) {
+    return NextResponse.json({ error: 'No file URL provided.' }, { status: 400 })
   }
 
-  // Step 1: Groq Whisper transcription
+  // Step 1: Download audio from blob URL server-side
+  let audioBlob: Blob
+  try {
+    const audioResponse = await fetch(blobUrl)
+    if (!audioResponse.ok) {
+      return NextResponse.json(
+        { error: 'Failed to download uploaded file. Please try again.' },
+        { status: 502 }
+      )
+    }
+    const audioBuffer = await audioResponse.arrayBuffer()
+    const contentType = audioResponse.headers.get('content-type') || 'audio/mp4'
+    audioBlob = new Blob([audioBuffer], { type: contentType })
+  } catch (err) {
+    console.error('Blob download error:', err)
+    return NextResponse.json(
+      { error: 'Failed to retrieve uploaded file. Please try again.' },
+      { status: 502 }
+    )
+  }
+
+  // Step 2: Groq Whisper transcription
   let transcription: WhisperResponse
   try {
     const groqForm = new FormData()
-    groqForm.append('file', audioFile, audioFile.name || 'audio.webm')
+    groqForm.append('file', audioBlob, fileName)
     groqForm.append('model', 'whisper-large-v3')
     groqForm.append('language', language)
     groqForm.append('response_format', 'verbose_json')
@@ -106,12 +132,15 @@ export async function POST(req: NextRequest) {
       { error: 'Failed to connect to Groq transcription service. Please try again.' },
       { status: 502 }
     )
+  } finally {
+    // Delete blob after downloading (cleanup) — fire and forget
+    del(blobUrl).catch((err) => console.error('Blob cleanup error:', err))
   }
 
   const rawTranscript = transcription.text || ''
   const rawSegments: WhisperSegment[] = transcription.segments || []
 
-  // Step 2: Claude correction
+  // Step 3: Claude correction
   let correctedTranscript = rawTranscript
   let correctedSegments = rawSegments.map((s) => ({ start: s.start, end: s.end, text: s.text }))
   let corrections: CorrectionItem[] = []
@@ -165,7 +194,7 @@ If no corrections are needed, return the original text unchanged and an empty co
     corrections = []
   }
 
-  // Step 3: Generate SRT
+  // Step 4: Generate SRT
   const srt = generateSrt(correctedSegments)
 
   return NextResponse.json({
