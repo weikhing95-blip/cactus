@@ -1,6 +1,6 @@
 # Cactus — Product Requirements Document
 
-**Version:** 0.1  
+**Version:** 0.2  
 **Date:** 2026-03-29  
 **Status:** Living Document
 
@@ -32,7 +32,7 @@ Cactus combines market-specific localization guides (covering Singlish, Manglish
 
 ---
 
-## 3. Current Features (v0.1)
+## 3. Current Features (v0.2)
 
 ### Core Localization Engine
 - **3 Target Markets:** Singapore (Singlish), Malaysia (Manglish/Bahasa Malaysia), Indonesia (Bahasa Indonesia/Jakarta slang)
@@ -48,6 +48,16 @@ Cactus combines market-specific localization guides (covering Singlish, Manglish
 - **Adapted Content panel:** The localized copy, with copy-to-clipboard button
 - **Cultural Notes panel:** 3–7 annotated notes explaining each cultural adaptation and why it works
 - **Extracted Text panel (image mode only):** Verbatim text extracted from uploaded image, shown in monospace for reference
+
+### Smart Video/Audio Captioning *(v0.2)*
+- **File upload:** Accepts `.mp3`, `.mp4`, `.wav`, `.m4a`, `.webm`, `.ogg`, `.mov` up to 25 MB
+- **Business context:** User describes their domain so AI can fix domain-specific transcription errors (e.g. prices, brand names, technical vocabulary)
+- **Language selection:** English, Bahasa Malaysia, Bahasa Indonesia, Mandarin
+- **Client-side audio extraction:** For video files, the Web Audio API extracts audio in-browser (no ffmpeg); falls back to sending the original file if extraction fails (Groq Whisper accepts video too)
+- **Groq Whisper transcription:** `whisper-large-v3` via Groq's free tier API (`verbose_json` response format for timestamps)
+- **Claude correction:** `claude-3-haiku-20240307` corrects domain-specific transcription errors using the business context
+- **Output:** Corrected transcript, list of changes made with reasons, downloadable `.srt` and `.txt` files
+- **Dedicated page:** `/captions` with nav link in header
 
 ### UX
 - Sticky header with market badge
@@ -86,7 +96,25 @@ Cactus combines market-specific localization guides (covering Singlish, Manglish
 
 ---
 
+### Known Issue — GROQ_API_KEY Required for Captioning
+
+**Issue:** The captioning feature requires a Groq API key for Whisper transcription. If `GROQ_API_KEY` is missing or set to the placeholder value, users see a friendly error message directing them to console.groq.com.
+
+**Workaround:** Add a free Groq API key to `.env.local`:
+```
+GROQ_API_KEY=your_actual_key_here
+```
+Keys are free at [console.groq.com](https://console.groq.com).
+
+---
+
 ## 5. Feature Backlog
+
+### ✅ Shipped in v0.2
+
+| Feature | Status |
+|---|---|
+| Smart Video/Audio Captioning (Groq Whisper + Claude correction) | ✅ Shipped |
 
 ### P0 — Critical (Must Fix Before Growth)
 
@@ -149,13 +177,43 @@ Cactus combines market-specific localization guides (covering Singlish, Manglish
                          └─────────────────┘
 ```
 
+### Captioning Architecture (v0.2)
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│                     Browser (Client)                        │
+│                                                             │
+│  ┌──────────────┐  Web Audio API   ┌─────────────────────┐  │
+│  │ Video File   │ ──────────────▶  │  WAV Audio Blob     │  │
+│  │ (.mp4/.mov)  │ (extract audio)  │  (or original file) │  │
+│  └──────────────┘                  └──────────┬──────────┘  │
+└─────────────────────────────────────────────────────────────┘
+                                                │
+                                                ▼
+┌─────────────────────────────────────────────────────────────┐
+│                 /api/captions (Next.js)                     │
+│                                                             │
+│  ┌──────────────────────┐     ┌──────────────────────────┐  │
+│  │  Groq Whisper API    │────▶│  Claude claude-3-haiku   │  │
+│  │  whisper-large-v3    │     │  (context correction)    │  │
+│  │  (verbose_json)      │     └──────────┬───────────────┘  │
+│  └──────────────────────┘               │                  │
+│                                          ▼                  │
+│                               { transcript, corrections,    │
+│                                 srt }                       │
+└─────────────────────────────────────────────────────────────┘
+```
+
 ### Stack
 
 | Layer | Technology |
 |---|---|
 | Framework | Next.js 16 (App Router, Turbopack) |
 | UI | React 18, Tailwind CSS 3 |
-| AI | Anthropic Claude API (`@anthropic-ai/sdk ^0.27`) |
+| AI (Localization) | Anthropic Claude API (`@anthropic-ai/sdk ^0.27`) |
+| AI (Caption Correction) | Anthropic Claude API — `claude-3-haiku-20240307` |
+| Transcription | Groq Whisper API — `whisper-large-v3` (free tier) |
+| Audio Extraction | Browser Web Audio API (client-side, no ffmpeg) |
 | Model | `claude-3-haiku-20240307` (vision-capable) |
 | Language | TypeScript 5 |
 | Deployment | Node.js 20+ (any Next.js-compatible host) |
@@ -166,6 +224,8 @@ Cactus combines market-specific localization guides (covering Singlish, Manglish
 - **System prompt architecture** — market + domain + tone guides are composed at runtime into a single system prompt; easy to add new markets without changing API contract
 - **JSON-only AI response** — Claude is instructed to return only valid JSON; response is stripped of markdown fences before parsing
 - **Stateless** — no database, no sessions; each request is fully self-contained (intentional for v0.1 simplicity)
+- **Client-side audio extraction** — uses the browser's native Web Audio API to extract audio from video without server-side dependencies or ffmpeg; falls back gracefully to sending the original file (Groq Whisper accepts video natively)
+- **Two-step transcription pipeline** — Groq Whisper provides fast, free transcription with timestamps; Claude then corrects domain-specific errors that whisper gets wrong (prices, brand names, jargon)
 
 ---
 
@@ -182,6 +242,12 @@ Cactus combines market-specific localization guides (covering Singlish, Manglish
 - [ ] Response shape validated (`adapted_content`, `cultural_notes` array) before returning to client
 - [ ] No raw Anthropic SDK errors exposed in 500 responses
 
+**API Route (`/api/captions`)**
+- [ ] GROQ_API_KEY presence and placeholder check before attempting transcription
+- [ ] File size/type validated server-side
+- [ ] Graceful fallback if Claude correction fails (return raw Groq transcript)
+- [ ] SRT format correct (1-indexed, comma millisecond separator)
+
 **Frontend (`page.tsx`)**
 - [ ] User-facing error messages are human-readable (no raw API strings or stack traces)
 - [ ] Technical errors logged to `console.error` for debugging
@@ -195,8 +261,13 @@ Cactus combines market-specific localization guides (covering Singlish, Manglish
 - [ ] `npm run build` passes with 0 TypeScript errors
 - [ ] No ESLint errors (run `npm run lint`)
 - [ ] `.env.local` contains `ANTHROPIC_API_KEY` (not `CLAUDE_API_KEY` or other variants)
+- [ ] `.env.local` contains `GROQ_API_KEY` (get free key at console.groq.com)
 
 **Manual Smoke Tests**
+- [ ] Test captioning with audio file + business context before each release
+- [ ] Captioning: upload .mp3 with business context → verify corrected transcript + SRT download
+- [ ] Captioning: upload .mp4 video → verify audio extraction + transcription
+- [ ] Captioning: missing GROQ_API_KEY → verify friendly error with link to console.groq.com
 - [ ] Text-only localization works for all 3 markets × 3 domains × 3 tones
 - [ ] Image upload and extraction works for JPG/PNG
 - [ ] Oversized file (>5MB) rejected with user-friendly error
