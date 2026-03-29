@@ -133,13 +133,20 @@ export default function Home() {
 
       if (!res.ok) {
         const data = await res.json().catch(() => ({}))
-        throw new Error(data.error || `Request failed (${res.status})`)
+        const technicalError = data.error || `Request failed (${res.status})`
+        console.error('Localize API error:', technicalError)
+        throw new Error('Something went wrong. Please try again.')
       }
 
       const data: LocalizeResult = await res.json()
       setResult(data)
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong')
+      const message = err instanceof Error ? err.message : 'Something went wrong. Please try again.'
+      // Log unexpected client-side errors (network failures, parse errors, etc.)
+      if (!(err instanceof Error && err.message === 'Something went wrong. Please try again.')) {
+        console.error('Localize client error:', err)
+      }
+      setError(message)
     } finally {
       setLoading(false)
     }
