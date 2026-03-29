@@ -9,7 +9,11 @@ type Market = 'singapore' | 'malaysia' | 'indonesia'
 type Domain = 'marketing' | 'legal' | 'casual'
 type Tone = 'professional' | 'casual' | 'playful'
 
-function buildSystemPrompt(market: Market, domain: Domain, tone: Tone): string {
+const VALID_MARKETS: Market[] = ['singapore', 'malaysia', 'indonesia']
+const VALID_DOMAINS: Domain[] = ['marketing', 'legal', 'casual']
+const VALID_TONES: Tone[] = ['professional', 'casual', 'playful']
+
+function buildSystemPrompt(market: Market, domain: Domain, tone: Tone, hasImage: boolean): string {
   const marketGuide: Record<Market, string> = {
     singapore: `
 ## Singapore (Singlish) Localization Guide
@@ -150,10 +154,38 @@ You are adapting content for an Indonesian audience. Indonesia is the world's la
 `,
   }
 
+  const imageInstructions = hasImage
+    ? `
+## Image Processing Instructions
+You will receive an image containing text (e.g. an advertisement, banner, product packaging, or screenshot). First extract ALL visible text from the image. Then provide a culturally adapted version for the target market. In your cultural notes, explain both the extraction choices and the cultural adaptations made.
+
+Your JSON response MUST include the "extracted_text" field with all text you found in the image.
+`
+    : ''
+
+  const outputFormat = hasImage
+    ? `{
+  "extracted_text": "All text extracted verbatim from the image",
+  "adapted_content": "The culturally adapted content here",
+  "cultural_notes": [
+    "Note 1 explaining a specific adaptation",
+    "Note 2 explaining another adaptation",
+    ...
+  ]
+}`
+    : `{
+  "adapted_content": "The culturally adapted content here",
+  "cultural_notes": [
+    "Note 1 explaining a specific adaptation",
+    "Note 2 explaining another adaptation",
+    ...
+  ]
+}`
+
   return `You are a world-class SEA (Southeast Asia) cultural localization expert with deep native fluency in Singlish, Manglish, and Bahasa Indonesia. You have spent years living and working across Singapore, Malaysia, and Indonesia.
 
 Your job is to take English content and adapt it to feel **genuinely local** — not just translated, but culturally resonant. You understand that great localization is about capturing the spirit and cultural context, not just swapping words.
-
+${imageInstructions}
 ${marketGuide[market]}
 ${domainGuide[domain]}
 ${toneGuide[tone]}
@@ -166,38 +198,123 @@ ${toneGuide[tone]}
 
 ## Output Format:
 You MUST respond with ONLY a valid JSON object (no markdown, no preamble) in this exact format:
-{
-  "adapted_content": "The culturally adapted content here",
-  "cultural_notes": [
-    "Note 1 explaining a specific adaptation",
-    "Note 2 explaining another adaptation",
-    ...
-  ]
-}
+${outputFormat}
 
 Each cultural note should be specific — reference the actual change made and the cultural reason behind it. Aim for 3–7 notes.`
 }
 
+type ImageMediaType = 'image/jpeg' | 'image/png' | 'image/gif' | 'image/webp'
+
+const ACCEPTED_MEDIA_TYPES: ImageMediaType[] = [
+  'image/jpeg',
+  'image/png',
+  'image/gif',
+  'image/webp',
+]
+
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json()
-    const { content, market, domain, tone } = body as {
-      content: string
-      market: Market
-      domain: Domain
-      tone: Tone
+    const contentType = req.headers.get('content-type') || ''
+    const isMultipart = contentType.includes('multipart/form-data')
+
+    let content = ''
+    let market: Market = 'singapore'
+    let domain: Domain = 'marketing'
+    let tone: Tone = 'casual'
+    let imageBase64: string | null = null
+    let imageMediaType: ImageMediaType | null = null
+
+    if (isMultipart) {
+      const formData = await req.formData()
+
+      content = (formData.get('content') as string) || ''
+      market = (formData.get('market') as Market) || 'singapore'
+      domain = (formData.get('domain') as Domain) || 'marketing'
+      tone = (formData.get('tone') as Tone) || 'casual'
+
+      const imageFile = formData.get('image') as File | null
+      if (imageFile && imageFile.size > 0) {
+        if (!ACCEPTED_MEDIA_TYPES.includes(imageFile.type as ImageMediaType)) {
+          return NextResponse.json(
+            { error: `Unsupported image type: ${imageFile.type}. Use JPG, PNG, GIF, or WEBP.` },
+            { status: 400 }
+          )
+        }
+        if (imageFile.size > 5 * 1024 * 1024) {
+          return NextResponse.json(
+            { error: 'Image too large. Maximum size is 5MB.' },
+            { status: 400 }
+          )
+        }
+        const arrayBuffer = await imageFile.arrayBuffer()
+        imageBase64 = Buffer.from(arrayBuffer).toString('base64')
+        imageMediaType = imageFile.type as ImageMediaType
+      }
+    } else {
+      const body = await req.json()
+      content = body.content || ''
+      market = body.market || 'singapore'
+      domain = body.domain || 'marketing'
+      tone = body.tone || 'casual'
     }
 
-    if (!content || !market || !domain || !tone) {
-      return NextResponse.json({ error: 'Missing required fields' }, { status: 400 })
+    // Validate params
+    if (!VALID_MARKETS.includes(market)) {
+      return NextResponse.json({ error: 'Invalid market' }, { status: 400 })
+    }
+    if (!VALID_DOMAINS.includes(domain)) {
+      return NextResponse.json({ error: 'Invalid domain' }, { status: 400 })
+    }
+    if (!VALID_TONES.includes(tone)) {
+      return NextResponse.json({ error: 'Invalid tone' }, { status: 400 })
     }
 
-    const wordCount = content.trim().split(/\s+/).filter(Boolean).length
-    if (wordCount > 500) {
-      return NextResponse.json({ error: 'Content exceeds 500 words' }, { status: 400 })
+    const hasImage = imageBase64 !== null
+
+    if (!hasImage && !content.trim()) {
+      return NextResponse.json({ error: 'Please provide content or upload an image.' }, { status: 400 })
     }
 
-    const systemPrompt = buildSystemPrompt(market, domain, tone)
+    if (content.trim()) {
+      const wordCount = content.trim().split(/\s+/).filter(Boolean).length
+      if (wordCount > 500) {
+        return NextResponse.json({ error: 'Content exceeds 500 words' }, { status: 400 })
+      }
+    }
+
+    const systemPrompt = buildSystemPrompt(market, domain, tone, hasImage)
+
+    // Build message content
+    type ContentBlock =
+      | { type: 'text'; text: string }
+      | { type: 'image'; source: { type: 'base64'; media_type: ImageMediaType; data: string } }
+
+    const userContentBlocks: ContentBlock[] = []
+
+    if (hasImage && imageBase64 && imageMediaType) {
+      userContentBlocks.push({
+        type: 'image',
+        source: {
+          type: 'base64',
+          media_type: imageMediaType,
+          data: imageBase64,
+        },
+      })
+    }
+
+    if (content.trim()) {
+      userContentBlocks.push({
+        type: 'text',
+        text: hasImage
+          ? `The image above contains the content to localize. ${content.trim() ? `Additional context from the user: ${content.trim()}` : ''}`
+          : `Please localize the following content:\n\n${content}`,
+      })
+    } else if (hasImage) {
+      userContentBlocks.push({
+        type: 'text',
+        text: 'Please extract all text from this image and provide a culturally localized version for the target market.',
+      })
+    }
 
     const message = await client.messages.create({
       model: 'claude-3-5-sonnet-20241022',
@@ -206,7 +323,7 @@ export async function POST(req: NextRequest) {
       messages: [
         {
           role: 'user',
-          content: `Please localize the following content:\n\n${content}`,
+          content: userContentBlocks,
         },
       ],
     })
@@ -214,9 +331,8 @@ export async function POST(req: NextRequest) {
     const rawText = message.content[0].type === 'text' ? message.content[0].text : ''
 
     // Parse JSON from response
-    let parsed: { adapted_content: string; cultural_notes: string[] }
+    let parsed: { adapted_content: string; cultural_notes: string[]; extracted_text?: string }
     try {
-      // Strip any accidental markdown fences
       const cleaned = rawText.replace(/^```json\s*/i, '').replace(/```\s*$/, '').trim()
       parsed = JSON.parse(cleaned)
     } catch {
