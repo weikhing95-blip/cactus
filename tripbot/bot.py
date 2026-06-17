@@ -169,7 +169,9 @@ def main() -> None:
     if not os.environ.get("ANTHROPIC_API_KEY"):
         raise SystemExit("ANTHROPIC_API_KEY is not set. See README / .env.example.")
 
-    app = Application.builder().token(token).build()
+    # concurrent_updates lets multiple users (and a user's rapid-fire photos)
+    # be handled in parallel instead of queueing behind one slow extraction.
+    app = Application.builder().token(token).concurrent_updates(True).build()
     app.add_handler(CommandHandler("start", cmd_start))
     app.add_handler(CommandHandler("help", cmd_start))
     app.add_handler(CommandHandler("reset", cmd_reset))
