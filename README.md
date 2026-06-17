@@ -1,115 +1,101 @@
-# Cactus 🌵
+# Trip-PDF Bot ✈️📄
 
-**Where global brands become local.**
+Send ticket photos to a Telegram bot, type `/done`, get back **one clean PDF**
+with all your trip info extracted and arranged in chronological order.
 
-Cactus is a SEA (Southeast Asia) cultural localization platform. Paste English content, pick your target market and tone, and get culturally adapted output that feels genuinely local — not just translated.
+> The North Star: a real traveler runs their messy pile of tickets through it
+> and gets a PDF they'd actually use. See [`docs/BUILD_PLAN.md`](docs/BUILD_PLAN.md).
 
-## Supported Markets
+## How it works
 
-| Market | Style |
-|--------|-------|
-| 🇸🇬 Singapore | Singlish particles (lah, leh, lor, sia, hor) |
-| 🇲🇾 Malaysia | Manglish + Bahasa Malaysia code-switching |
-| 🇮🇩 Indonesia | Bahasa Indonesia + Jakarta slang (dong, sih, nih, ya kan) |
+```
+ticket photos/PDFs ──▶ Claude vision extract ──▶ /done ──▶ WeasyPrint PDF
+        (in memory, never written to disk; dropped after the PDF is sent)
+```
 
-## Features
+- **Extraction** — each image/PDF goes to Claude Opus 4.8 vision with a strict
+  JSON schema, so it returns structured trip data and never invents fields. A
+  blurry ticket yields nulls, not guesses; a selfie is politely rejected.
+- **State** — a simple in-memory dict keyed by Telegram user id, holding only
+  the extracted fields. A restart clears it (accepted MVP trade-off).
+- **Privacy** — source ticket images are read then discarded. Nothing is
+  written to disk; the session (with its PII) is cleared the moment the PDF
+  is delivered.
 
-- 🌏 **3 SEA markets** — Singapore, Malaysia, Indonesia
-- 📝 **3 domains** — Marketing, Legal, Casual/Social
-- 🎭 **3 tones** — Professional, Casual, Playful
-- 💡 **Cultural notes** — explains each adaptation made and why
-- ⚡ **Powered by Claude** (claude-3-5-sonnet-20241022)
+## Project layout
 
-## Tech Stack
+```
+tripbot/
+├── bot.py        # Telegram handlers, long-polling entry point
+├── extract.py    # image/PDF -> structured items (Claude vision)
+├── models.py     # TripItem, in-memory session store, sorting/formatting
+├── pdf.py        # sorted items -> PDF (HTML template via WeasyPrint)
+├── requirements.txt
+└── .env.example
+docs/BUILD_PLAN.md
+```
 
-- **Next.js 14** (App Router)
-- **Tailwind CSS**
-- **Anthropic Claude API**
-- **TypeScript**
+## Setup
 
-## Running Locally
+### 1. Credentials (Build Plan, Phase 0)
 
-### Prerequisites
-
-- Node.js 18+
-- An Anthropic API key
-
-### Setup
+- **Telegram bot token** — message [@BotFather](https://t.me/BotFather),
+  send `/newbot`, follow the prompts, copy the token.
+- **Anthropic API key** — from the
+  [Anthropic Console](https://console.anthropic.com) → API keys.
 
 ```bash
-# 1. Clone/enter the project
-cd cactus
-
-# 2. Install dependencies (include dev deps explicitly if NODE_ENV=production)
-npm install --include=dev
-
-# 3. Set your API key
-echo "ANTHROPIC_API_KEY=your_key_here" > .env.local
-
-# 4. Start the dev server
-npm run dev
+cp tripbot/.env.example tripbot/.env
+# edit tripbot/.env and paste both values
 ```
 
-Then open [http://localhost:3000](http://localhost:3000).
+### 2. System dependencies (WeasyPrint)
 
-## Deploying to Vercel
-
-1. Push this project to a GitHub repository
-2. Go to [vercel.com](https://vercel.com) and import the repo
-3. Add environment variable: `ANTHROPIC_API_KEY` = your key
-4. Deploy — Vercel auto-detects Next.js, no config needed
-
-Or use the Vercel CLI:
+WeasyPrint renders the PDF and needs Pango/Cairo/GDK-PixBuf at the system level.
 
 ```bash
-npm i -g vercel
-vercel
-# Follow prompts, add ANTHROPIC_API_KEY when asked
+# Debian / Ubuntu
+sudo apt-get install -y libpango-1.0-0 libpangocairo-1.0-0 \
+    libgdk-pixbuf-2.0-0 libffi-dev libcairo2
+
+# macOS (Homebrew)
+brew install pango gdk-pixbuf libffi
 ```
 
-## Project Structure
+See the [WeasyPrint install docs](https://doc.courtbouillon.org/weasyprint/stable/first_steps.html)
+if you hit a missing-library error.
 
-```
-cactus/
-├── src/
-│   └── app/
-│       ├── layout.tsx          # Root layout
-│       ├── page.tsx            # Home page with localization form
-│       ├── globals.css         # Tailwind imports
-│       └── api/
-│           └── localize/
-│               └── route.ts   # POST /api/localize — calls Claude
-├── .env.local                  # API key (not committed)
-├── tailwind.config.ts
-├── next.config.js
-└── package.json
+### 3. Python dependencies
+
+```bash
+cd tripbot
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
-## API
+### 4. Run
 
-### `POST /api/localize`
-
-**Request body:**
-```json
-{
-  "content": "Your English content here",
-  "market": "singapore | malaysia | indonesia",
-  "domain": "marketing | legal | casual",
-  "tone": "professional | casual | playful"
-}
+```bash
+python bot.py
 ```
 
-**Response:**
-```json
-{
-  "adapted_content": "Culturally adapted version of your content",
-  "cultural_notes": [
-    "Used 'lah' at the end of the opening line to create warmth and familiarity...",
-    "..."
-  ]
-}
-```
+Then open your bot in Telegram, send a ticket photo, and type `/done`.
 
-## License
+## Using it
 
-MIT
+| Command | What it does |
+|---------|--------------|
+| `/start` | Instructions |
+| (send photo/PDF) | Reads the ticket, replies with a confirmation line |
+| `/done` | Builds and sends the trip PDF, then clears your session |
+| `/reset` | Clears your session without building a PDF |
+
+Items the model wasn't sure about (low confidence, or a flight/train with no
+readable time) are flagged **⚠️ needs review** in both the chat confirmation
+and the PDF, so nothing is silently wrong.
+
+## Status vs. the build plan
+
+Implemented: Phases 1–4 (skeleton, extraction, synthesis+PDF, resilience).
+Phase 0 is your credentials above; Phase 5 is the real-user validation — run
+a real trip through it and note how many fields needed correcting.
